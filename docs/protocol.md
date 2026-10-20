@@ -40,12 +40,12 @@ All start with `0F` and end with `FF FF`.
 | Offset | Field | Unit / values |
 |--------|-------|---------------|
 | 0 | mode | 0 Charge, 1 Refresh, 2 Break-In, 3 Discharge, 4 Cycle, 5 Done, 6 Wait, 7 Error |
-| 1 | battery present | 0 / 1 |
+| 1 | battery present | 0 empty; reads 2 with a battery (treat non-zero as present) |
 | 2-3 | capacity | mAh |
 | 4-5 | work time | **seconds, restarts at 0 in every phase of a program** |
 | 6-7 | voltage | mV |
 | 8-9 | current | mA |
-| 10 | state | 0 not working, 1 charging, 2 rest, 3 discharging, 4 rest, 5 done, 6 done |
+| 10 | state | 0 not working, 1 charging, 2 rest, 3 discharging, 4 rest, 5 done, 6 done. Seen: 4 in the rest after a discharge, 5 at the end of Refresh, 6 at the end of Discharge |
 | 11 | temperature | raw - 40 = °C |
 | 12 | cycle count | |
 | 13-14 | internal resistance | mOhm |
@@ -82,7 +82,9 @@ deliberately never uses.
 Observed phases (state byte in brackets):
 
 - **Charge**: charging (1) until the charger's own 300-minute timer, or full.
-- **Refresh**: charge (1) 5 h, rest (2) 1 h, discharge (3), rest (2) 1 h, charge (1) 5 h, done (5).
+- **Discharge**: discharging (3) at the set current until the cut-off voltage (0.90 V in the tested run), then
+  done (6). The slot does not charge afterwards.
+- **Refresh**: charge (1) 5 h, rest (2) 1 h, discharge (3), rest (4) 1 h, charge (1) 5 h, done (5).
 - **Break-In** and **Cycle**: the phase order and durations are are assumed from a published review of the charger and have not been observed.
 
 The work time restarts at 0 at each phase change, and the mode byte stays the same for the whole program.
@@ -98,9 +100,11 @@ Checked on a real NC2500:
 - Every layer above, and the status query. The four slot records decode correctly.
 - Units for voltage, current, capacity, temperature and time.
 - **Charge**: set a slot to 0.2 A, 0.3 A and back; the charger followed within one poll.
+- **Discharge**: ran a complete program at 0.5 A on a full NiMH cell: 3 h 24 min, 1704 mAh, ended at 0.90 V in
+  state 6, with the mode byte still 3.
 - **Refresh**: ran a complete program on three NiMH cells, with the phase sequence and the per-phase work time described in section 4.
 - **Stop** (set-slot mode 5): stopped a slot during a charge and during a discharge. Mode 5 and 0 mA by the next
   poll, other slots unaffected, and a set-slot afterwards started the slot again.
 
-Decoded from the vendor app but **never tried on a real battery**: the Break-In, Discharge and Cycle set-slot
+Decoded from the vendor app but **never tried on a real battery**: the Break-In and Cycle set-slot
 packets, the system-settings commands, and the exact Break-In and Cycle phase timings.
