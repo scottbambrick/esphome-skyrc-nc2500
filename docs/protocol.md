@@ -69,9 +69,14 @@ with `chk` = sum of bytes 2..13. Mode numbers are as in the table above (0-4). S
 
 Limits: charge 200-2500 mA, discharge 100-1000 mA, capacity 500-3500 mAh (all in steps of 100), cycles 1-12.
 
-There is **no stop command**; stop a slot with the buttons on the charger. System settings (delta-V,
-temperature cut-off, cut-off voltage, trickle charge) use cmd `0A` (set) and `0B` (get). They are decoded
-but not exposed. The app also has firmware-update commands, which this project deliberately never uses.
+**Stop.** The vendor app has no stop command, but a set-slot with mode 5 (Done) and all values zero ends a
+slot's program: `0F 0D 05 <slot 0-3> 05 00 00 00 00 00 00 00 00 00 <chk> FF FF`. By the next status reply
+the slot reports mode 5 and 0 mA, and its work time restarts; the capacity returns to 0 a few seconds later. The
+state byte keeps its previous value. A normal set-slot starts the slot again.
+
+System settings (delta-V, temperature cut-off, cut-off voltage, trickle charge) use cmd `0A` (set) and `0B`
+(get). They are decoded but not exposed. The app also has firmware-update commands, which this project
+deliberately never uses.
 
 ## 4. Program sequencing
 Observed phases (state byte in brackets):
@@ -94,6 +99,8 @@ Checked on a real NC2500:
 - Units for voltage, current, capacity, temperature and time.
 - **Charge**: set a slot to 0.2 A, 0.3 A and back; the charger followed within one poll.
 - **Refresh**: ran a complete program on three NiMH cells, with the phase sequence and the per-phase work time described in section 4.
+- **Stop** (set-slot mode 5): stopped a slot during a charge and during a discharge. Mode 5 and 0 mA by the next
+  poll, other slots unaffected, and a set-slot afterwards started the slot again.
 
 Decoded from the vendor app but **never tried on a real battery**: the Break-In, Discharge and Cycle set-slot
 packets, the system-settings commands, and the exact Break-In and Cycle phase timings.

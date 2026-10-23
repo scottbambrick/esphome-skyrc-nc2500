@@ -52,7 +52,8 @@ Working on real hardware (NC2500, firmware as of Oct 2026):
 - Reading all four slots.
 - **Charge** and **Refresh** modes have been set and run on real cells (a complete Refresh).
 - **Break-In**, **Discharge** and **Cycle** are decoded from the vendor app but **not tested on a real battery**.
-- There is no stop command in the protocol - use the charger's buttons.
+- **Stop**: the vendor app has no stop command, but a set-slot with mode 5 (Done) ends a slot's program. The
+  example has a "Slot N Stop" button for each slot.
 - System settings (delta-V, cut-offs) and firmware update commands are deliberately not implemented.
 
 `home-assistant/progress-estimates-package.yaml` is an optional Home Assistant package that estimates charge %

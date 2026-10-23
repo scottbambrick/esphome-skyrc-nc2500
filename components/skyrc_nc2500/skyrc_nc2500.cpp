@@ -1124,6 +1124,35 @@ bool SkyrcNC2500::apply_slot(uint8_t slot, const std::string &mode, float charge
   return true;
 }
 
+bool SkyrcNC2500::stop_slot(uint8_t slot) {
+  if (slot >= NUM_SLOTS)
+    return false;
+  if (this->state_ != State::READY) {
+    ESP_LOGW(TAG, "Slot %u: not stopped - the charger is not connected", slot + 1);
+    return false;
+  }
+  if (!this->slot_present_[slot]) {
+    ESP_LOGW(TAG, "Slot %u: not stopped - there is no battery in it", slot + 1);
+    return false;
+  }
+
+  // A set-slot with mode 5 (Done) and no values ends the slot's program:
+  // 0F 0D 05 <slot> 05 00 00 00 00 00 00 00 00 00 <chk> FF FF
+  uint8_t p[17] = {0x0F, 0x0D, 0x05, slot, 0x05};
+  uint8_t sum = 0;
+  for (int i = 2; i < 14; i++)
+    sum += p[i];
+  p[14] = sum;
+  p[15] = 0xFF;
+  p[16] = 0xFF;
+
+  ESP_LOGI(TAG, "Slot %u: stopping", slot + 1);
+  this->send_rfa_(std::vector<uint8_t>(p, p + sizeof(p)));
+  // Ask for the new state shortly afterwards instead of waiting for the next poll.
+  this->last_poll_ = millis() - this->poll_interval_ms_ + 2000;
+  return true;
+}
+
 }  // namespace skyrc_nc2500
 }  // namespace esphome
 

@@ -156,7 +156,7 @@ switch:
 #   Break-In:  rated capacity                      Discharge: discharge current
 #   Cycle:     charge + discharge current + cycles
 # Limits are the charger's own: charge 0.2-2.5 A, discharge 0.1-1.0 A, capacity 500-3500 mAh, cycles 1-12.
-# The app has no stop command: to stop a slot, use the buttons on the charger.
+# "Slot N Stop" ends the slot's program (the app has no stop command; see docs/protocol.md).
 select:
   - platform: template
     id: slot1_set_mode
@@ -391,6 +391,11 @@ button:
                                  id(slot1_set_charge).state, id(slot1_set_discharge).state,
                                  id(slot1_set_capacity).state, id(slot1_set_cycles).state);
   - platform: template
+    name: "Slot 1 Stop"
+    icon: mdi:stop-circle
+    on_press:
+      - lambda: id(charger).stop_slot(0);
+  - platform: template
     name: "Slot 2 Apply Settings"
     icon: mdi:play-circle
     on_press:
@@ -398,6 +403,11 @@ button:
           id(charger).apply_slot(1, std::string(id(slot2_set_mode).current_option()),
                                  id(slot2_set_charge).state, id(slot2_set_discharge).state,
                                  id(slot2_set_capacity).state, id(slot2_set_cycles).state);
+  - platform: template
+    name: "Slot 2 Stop"
+    icon: mdi:stop-circle
+    on_press:
+      - lambda: id(charger).stop_slot(1);
   - platform: template
     name: "Slot 3 Apply Settings"
     icon: mdi:play-circle
@@ -407,6 +417,11 @@ button:
                                  id(slot3_set_charge).state, id(slot3_set_discharge).state,
                                  id(slot3_set_capacity).state, id(slot3_set_cycles).state);
   - platform: template
+    name: "Slot 3 Stop"
+    icon: mdi:stop-circle
+    on_press:
+      - lambda: id(charger).stop_slot(2);
+  - platform: template
     name: "Slot 4 Apply Settings"
     icon: mdi:play-circle
     on_press:
@@ -414,3 +429,8 @@ button:
           id(charger).apply_slot(3, std::string(id(slot4_set_mode).current_option()),
                                  id(slot4_set_charge).state, id(slot4_set_discharge).state,
                                  id(slot4_set_capacity).state, id(slot4_set_cycles).state);
+  - platform: template
+    name: "Slot 4 Stop"
+    icon: mdi:stop-circle
+    on_press:
+      - lambda: id(charger).stop_slot(3);

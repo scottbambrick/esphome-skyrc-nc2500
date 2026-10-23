@@ -82,6 +82,10 @@ class SkyrcNC2500 : public Component {
   bool apply_slot(uint8_t slot, const std::string &mode, float charge_a, float discharge_a, float capacity_mah,
                   float cycles);
 
+  // End a slot's program. The vendor app has no stop command; a set-slot with mode 5 (Done) and no values
+  // does it (docs/protocol.md). slot is 0-3.
+  bool stop_slot(uint8_t slot);
+
   // Called from the Bluetooth stack's task.
   static void gap_callback_(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param);
   static void spp_callback_(esp_spp_cb_event_t event, esp_spp_cb_param_t *param);
