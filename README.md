@@ -39,13 +39,16 @@ it for the phone app.
 
 ## Changes
 
+- **v0.2.0**: `stop_slot()` and a "Slot N Stop" button per slot in the example (a set-slot with mode 5 ends
+  the slot's program); Discharge is now tested on hardware; protocol notes corrected (present byte, state
+  codes). Thanks to [@rpcyan586](https://github.com/rpcyan586) for both.
 - **v0.1.0** (first tagged release): `log_frames` now defaults to `false`; the pairing PIN is no longer
   written to the logs; reconnect timing stays correct after ~49.7 days of uptime (millis() wrap); boards
   without classic Bluetooth are rejected at validation; GitHub Actions compiles the example on every push.
 
 To avoid `main` changing underneath you, pin the component to a
 [release](https://github.com/scottbambrick/esphome-skyrc-nc2500/releases):
-`source: github://scottbambrick/esphome-skyrc-nc2500@v0.1.0`.
+`source: github://scottbambrick/esphome-skyrc-nc2500@v0.2.0`.
 
 ## Status
 Working on real hardware (NC2500, firmware as of Oct 2026):
