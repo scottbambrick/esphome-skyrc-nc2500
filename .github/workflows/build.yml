@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install ESPHome
-        run: pip install "esphome==2026.9.1"
+        run: pip install "esphome==2026.10.1"
       - name: Point the example at this checkout and add dummy secrets
         run: |
           sed 's#- source: github://scottbambrick/esphome-skyrc-nc2500#- source: { type: local, path: components }#' \
