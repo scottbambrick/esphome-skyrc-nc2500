@@ -85,7 +85,15 @@ Observed phases (state byte in brackets):
 - **Discharge**: discharging (3) at the set current until the cut-off voltage (0.90 V in the tested run), then
   done (6). The slot does not charge afterwards.
 - **Refresh**: charge (1) 5 h, rest (2) 1 h, discharge (3), rest (4) 1 h, charge (1) 5 h, done (5).
-- **Break-In** and **Cycle**: the phase order and durations are are assumed from a published review of the charger and have not been observed.
+- **Break-In** (rated capacity C): charging (1) at C/10 for 960 min, rest 60 min, discharging (3) at C/5 to the
+  cut-off, rest 60 min, charging (1) at C/10 for 960 min, done. The charge current can be below the 200 mA set-slot
+  minimum (50 mA at C = 500 mAh).
+- **Cycle** (N cycles): charging (1), rest 60 min, discharging (3), rest 60 min, N times, then a final charging (1)
+  and done. A charge ends on its own (on healthy cells at 103-109 % of the discharge before) or at the
+  300-minute timer.
+
+For Break-In and Cycle the rest and done codes weren't logged: the component names 2 and 4 both Resting, and 5 and
+6 both Done.
 
 The work time restarts at 0 at each phase change, and the mode byte stays the same for the whole program.
 Progress estimates therefore have to track the phase themselves (see `home-assistant/progress-estimates-package.yaml`).
@@ -105,6 +113,9 @@ Checked on a real NC2500:
 - **Refresh**: ran a complete program on three NiMH cells, with the phase sequence and the per-phase work time described in section 4.
 - **Stop** (set-slot mode 5): stopped a slot during a charge and during a discharge. Mode 5 and 0 mA by the next
   poll, other slots unaffected, and a set-slot afterwards started the slot again.
+- **Break-In**: 18 complete programs on all four slots, at 500, 800, 1000 and 2000 mAh, with the phases and
+  currents in section 4.
+- **Cycle**: 2 cycles at 0.5 A and again at 1 A charge (0.4 A discharge) on two healthy NiMH AA cells, and 0.5 A
+  runs on two weak cells, as in section 4.
 
-Decoded from the vendor app but **never tried on a real battery**: the Break-In and Cycle set-slot
-packets, the system-settings commands, and the exact Break-In and Cycle phase timings.
+Decoded from the vendor app but **never tried**: the system-settings commands.

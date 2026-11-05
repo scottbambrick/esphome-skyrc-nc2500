@@ -55,7 +55,7 @@ Working on real hardware (NC2500, firmware as of Oct 2026):
 - Reading all four slots.
 - **Charge**, **Refresh** and **Discharge** have been set and run on real cells (a complete Refresh and a complete
   Discharge).
-- **Break-In** and **Cycle** are decoded from the vendor app but **not tested on a real battery**.
+- **Break-In** and **Cycle** have been run to completion on NiMH AA cells (see Observed behaviour).
 - **Stop**: the vendor app has no stop command, but a set-slot with mode 5 (Done) ends a slot's program. The
   example has a "Slot N Stop" button for each slot.
 - System settings (delta-V, cut-offs) and firmware update commands are deliberately not implemented.
@@ -72,6 +72,15 @@ from a node called `office-battery-charger` - adjust to yours.
   The mAh counter restarts with each charge phase and ended at 2499 mAh (5 h x 0.5 A).
 - **Discharge** (0.5 A, from a full cell): discharged to the cut-off voltage (0.90 V), then Done: 1704 mAh in
   3 h 24 min. The mAh counter counts the discharged amount. The slot does not charge afterwards.
+- **Break-In** (rated capacity C; tried at 500, 800, 1000 and 2000 mAh): charge at C/10 for 16 h (1.6 x C), rest
+  1 h, discharge at C/5 to the cut-off, rest 1 h, charge at C/10 for 16 h, then Done: 34-39 h in all. The charges
+  ran the full 16 h every time. The charge current goes below the 200 mA set-slot minimum (50 mA at 500 mAh). A
+  cell already at the cut-off gets a discharge of under 20 s, and the program carries on.
+- **Cycle** (N cycles; seen with N = 2): charge, rest 1 h, discharge to the cut-off, rest 1 h, N times, then a
+  final charge and Done. The cycle number reads 1, then 2 from the second charge. The charges end on their own:
+  on healthy 1900 mAh AA cells at 0.5 A and 1 A they stopped at 103-109 % of the discharge before, in 96-232 min.
+  On weak cells a charge can run to the 300-minute timer (2499 mAh at 0.5 A); the program then carries on. On a
+  full cell the first charge stops within 20 s.
 
 ## Protocol
 [`docs/protocol.md`](docs/protocol.md) describes the full stack (link, module, adapter, session, charger layers).
