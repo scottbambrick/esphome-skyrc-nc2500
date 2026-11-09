@@ -1,0 +1,14 @@
+# Optional: `pip install pre-commit && pre-commit install` runs the same style checks as CI before each commit.
+# Versions match ESPHome's own (.pre-commit-config.yaml in esphome/esphome).
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.10
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v13.0.1
+    hooks:
+      - id: clang-format
+        types_or: [c, c++]

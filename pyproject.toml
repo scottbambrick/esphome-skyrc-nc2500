@@ -1,0 +1,32 @@
+# Lint and format settings for the Python half of the component (__init__.py).
+# The rules are ESPHome's own (esphome/esphome pyproject.toml), so the code reads like any other component.
+
+[tool.ruff]
+required-version = ">=0.5.0"
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+  "B",    # flake8-bugbear
+  "C4",   # flake8-comprehensions
+  "E",    # pycodestyle
+  "F",    # pyflakes
+  "I",    # isort
+  "PERF", # performance
+  "PIE",  # flake8-pie
+  "PL",   # pylint
+  "RET",  # flake8-return
+  "SIM",  # flake8-simplify
+  "UP",   # pyupgrade
+  "W",    # pycodestyle warnings
+]
+ignore = [
+  "E501",    # line too long (the formatter handles it)
+  "PLR2004", # magic value used in comparison
+]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+known-first-party = ["esphome"]
+combine-as-imports = true
+split-on-trailing-comma = false

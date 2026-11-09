@@ -12,6 +12,31 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    # Code style: ESPHome's (Google-based) C++ style via its .clang-format, and ruff for the Python.
+    # On failure the log shows the exact change the formatter wants.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install the formatters (the versions ESPHome uses)
+        run: pip install "clang-format==13.0.1" "ruff==0.16.10"
+      - name: C++ format (clang-format)
+        run: |
+          status=0
+          for f in components/skyrc_nc2500/*.cpp components/skyrc_nc2500/*.h; do
+            clang-format --style=file "$f" | diff -u "$f" - || status=1
+          done
+          exit $status
+      - name: Python lint (ruff check)
+        if: ${{ !cancelled() }}
+        run: ruff check --output-format=github components
+      - name: Python format (ruff format)
+        if: ${{ !cancelled() }}
+        run: ruff format --diff components
+
   compile:
     runs-on: ubuntu-latest
     steps:
