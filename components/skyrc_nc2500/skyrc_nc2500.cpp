@@ -14,13 +14,19 @@
 #include <cmath>
 #include <cstring>
 
+// Bluedroid internal, not in ESP-IDF's public API: the role we ask for when accepting an incoming radio link.
+extern "C" uint8_t L2CA_SetDesireRole(uint8_t new_role);
+
 namespace esphome {
 namespace skyrc_nc2500 {
 
 static const char *const TAG = "skyrc_nc2500";
 
-// The charger's "iBT-02" bridge module speaks a framed protocol over the serial (SPP) link.
-// Everything below was read out of the vendor's Android app (com.revogi.smartcharge 0.9.9).
+// ---------------------------------------------------------------------------------------------
+// Protocol constants. The charger's "iBT-02" Bluetooth module speaks a framed protocol over the serial link;
+// all of this was read out of the vendor's Android app (com.revogi.smartcharge 0.9.9). See docs/protocol.md.
+// ---------------------------------------------------------------------------------------------
+
 static const uint8_t LINK_SOF = 0x55;
 static const uint8_t SESSION_ID = 0x1B;
 static const uint8_t CMD_INFO_REQUEST = 0x01;
@@ -30,12 +36,59 @@ static const uint8_t CMD_CHALLENGE = 0x60;
 static const uint8_t CMD_RFA_DATA = 0x91;
 static const uint8_t CMD_CHALLENGE_REPLY = 0xE0;
 static const uint8_t RFA_TYPE = 0x82;
+static const uint8_t MODULE_OPEN_CHANNEL = 0x3F;
+static const uint8_t MODULE_CHANNEL_DATA_OUT = 0x43;
+static const uint8_t MODULE_CHANNEL_DATA_IN = 0x42;
+static const uint8_t MODULE_ACK = 0x41;
 static const uint16_t INFO_IDS[] = {0x0100, 0x0100, 0x0101, 0x0102, 0x0103, 0x0106, 0x0107, 0x2000, 0x2100};
 static const uint8_t AUTH_KEY[16] = {0xBB, 0x11, 0x77, 0x33, 0xBB, 0x11, 0x77, 0x33,
                                      0xCC, 0x63, 0x11, 0x56, 0xDC, 0xF0, 0x0F, 0x26};
 
-static const char *const MODE_NAMES[] = {"Charge", "Refresh", "Break-In", "Discharge", "Cycle", "Done", "Wait", "Error"};
-static const char *const STATE_NAMES[] = {"Not working", "Charging", "Resting", "Discharging", "Resting", "Done", "Done"};
+static const char *const MODE_NAMES[] = {"Charge", "Refresh", "Break-In", "Discharge",
+                                         "Cycle",  "Done",    "Wait",     "Error"};
+static const char *const STATE_NAMES[] = {"Not working", "Charging", "Resting", "Discharging",
+                                          "Resting",     "Done",     "Done"};
+
+static const uint8_t HCI_ROLE_MASTER = 0x00;
+
+// ---------------------------------------------------------------------------------------------
+// Timing (milliseconds)
+// ---------------------------------------------------------------------------------------------
+
+// Retry delays for calling the charger: start short, double each time, up to a cap. Calling a known address is
+// cheap; a search competes with Wi-Fi for the radio for 10 s, so it backs off further.
+static const uint32_t RETRY_MIN = 5000;
+static const uint32_t RETRY_MAX_KNOWN_ADDRESS = 30000;
+static const uint32_t RETRY_MAX_SEARCH = 120000;
+// After losing a link, wait this long before calling the charger ourselves. When it comes back on it calls us,
+// and while we are calling out we can't hear it.
+static const uint32_t WAIT_FOR_CALL_IN = 30000;
+// When the charger calls us it usually opens the serial channel itself; give it this long before we do.
+static const uint32_t CALL_IN_GRACE = 2000;
+// How often to re-assert "accept incoming links as master" (see loop()).
+static const uint32_t ROLE_REASSERT = 1000;
+
+static const uint32_t INQUIRY_TIMEOUT = 20000;
+static const uint32_t SDP_TIMEOUT = 15000;
+static const uint32_t CONNECT_TIMEOUT = 20000;
+static const uint32_t MODULE_TIMEOUT = 8000;  // module must open our data channel within this
+static const uint32_t INFO_TIMEOUT = 15000;   // info requests must be acknowledged within this
+static const uint32_t INFO_SETTLE = 1500;     // pause after the info requests, as the vendor app does
+static const uint32_t MODE_SETTLE = 800;      // pause after switching to data mode
+static const uint32_t CHALLENGE_RETRY = 1500;
+static const uint8_t CHALLENGE_TRIES = 3;
+
+static const uint32_t KEEPALIVE_INTERVAL = 5000;  // cheap query between polls, so a dead link shows up quickly
+static const uint32_t MIN_SILENCE_TIMEOUT = 15000;
+static const uint32_t ACK_RESEND = 500;   // module messages are resent this often until acknowledged...
+static const uint8_t ACK_MAX_TRIES = 20;  // ...this many times (10 s), after which the link counts as dead
+static const uint32_t TX_SPACING = 25;    // gap between serial writes
+static const uint32_t STATUS_AFTER_COMMAND = 2000;
+
+// Queue limits: if the charger stops keeping up, drop rather than pile up.
+static const size_t MAX_EVENTS = 64;
+static const size_t MAX_TX_FRAMES = 32;
+static const size_t MAX_MODULE_MESSAGES = 24;
 
 static SkyrcNC2500 *instance_ = nullptr;
 
@@ -46,11 +99,10 @@ static std::string bda_to_string(const uint8_t *b) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Setup / config
+// Setup and configuration
 // ---------------------------------------------------------------------------------------------
 
 void SkyrcNC2500::set_mac(uint64_t mac) {
-  this->mac_ = mac;
   this->has_mac_ = true;
   for (int i = 0; i < 6; i++)
     this->target_bda_[i] = (mac >> (8 * (5 - i))) & 0xFF;
@@ -59,6 +111,7 @@ void SkyrcNC2500::set_mac(uint64_t mac) {
 void SkyrcNC2500::setup() {
   instance_ = this;
   this->lbuf_.reserve(300);
+  this->backoff_ms_ = RETRY_MIN;
 
   esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
   esp_err_t err = esp_bt_controller_init(&cfg);
@@ -89,15 +142,15 @@ void SkyrcNC2500::setup() {
   spp_cfg.mode = ESP_SPP_MODE_CB;
   spp_cfg.enable_l2cap_ertm = true;
   spp_cfg.tx_buffer_size = 0;
-  err = esp_spp_enhanced_init(&spp_cfg);
+  err = esp_spp_enhanced_init(&spp_cfg);  // finishes with ESP_SPP_INIT_EVT
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "SPP init failed: %s", esp_err_to_name(err));
     this->mark_failed();
     return;
   }
 
-  // We are only ever the initiator: not connectable, not discoverable.
-  esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+  // Connectable, so we can answer the charger's call at power-on; not discoverable, so nothing else finds us.
+  esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
 
   // "Just works" for secure simple pairing; a fixed PIN for older (legacy) pairing.
   esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_NONE;
@@ -121,8 +174,7 @@ void SkyrcNC2500::dump_config() {
   LOG_BINARY_SENSOR("  ", "Connected", this->connected_);
 }
 
-// Before a reboot or update, let go of the charger properly. Otherwise it keeps the dead link for a couple of
-// minutes and refuses new connections.
+// Before a reboot or update, let go of the charger properly, so it doesn't sit on a dead link.
 void SkyrcNC2500::on_shutdown() {
   if (this->spp_handle_ != 0) {
     esp_spp_disconnect(this->spp_handle_);
@@ -136,6 +188,8 @@ void SkyrcNC2500::set_enabled(bool enabled) {
   this->enabled_ = enabled;
   ESP_LOGI(TAG, "Bluetooth link %s", enabled ? "enabled" : "released (charger free for the phone app)");
   this->outage_logged_ = false;
+  // Stop answering the charger's calls too while released, or we would take it straight back.
+  esp_bt_gap_set_scan_mode(enabled ? ESP_BT_CONNECTABLE : ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
   if (!enabled) {
     this->was_connected_ = false;
     this->disconnect_();
@@ -143,17 +197,17 @@ void SkyrcNC2500::set_enabled(bool enabled) {
     this->set_state_(State::IDLE);
   } else {
     this->next_connect_at_ = millis();
-    this->backoff_ms_ = 5000;
+    this->backoff_ms_ = RETRY_MIN;
   }
 }
 
 // ---------------------------------------------------------------------------------------------
-// Bluetooth stack callbacks (run on the Bluetooth task: copy the data and queue it)
+// Bluetooth stack callbacks: run on the stack's task, so they only copy what they need and queue it
 // ---------------------------------------------------------------------------------------------
 
 void SkyrcNC2500::push_event_(BtEvent &&e) {
   std::lock_guard<std::mutex> lock(this->mutex_);
-  if (this->events_.size() < 64)
+  if (this->events_.size() < MAX_EVENTS)
     this->events_.push_back(std::move(e));
 }
 
@@ -181,14 +235,13 @@ void SkyrcNC2500::gap_callback_(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param
       instance_->push_event_(std::move(e));
       break;
     }
-    case ESP_BT_GAP_DISC_STATE_CHANGED_EVT: {
+    case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
       if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
         BtEvent e;
         e.type = BtEvent::GAP_DISC_STOPPED;
         instance_->push_event_(std::move(e));
       }
       break;
-    }
     case ESP_BT_GAP_PIN_REQ_EVT: {
       esp_bt_pin_code_t pin_code = {};
       size_t n = std::min<size_t>(instance_->pin_.size(), 16);
@@ -200,6 +253,19 @@ void SkyrcNC2500::gap_callback_(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param
     case ESP_BT_GAP_CFM_REQ_EVT:
       esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
       break;
+    case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT: {
+      // HCI status: 0x00 = link up, 0x04 = page timeout (nobody answered), others are refusals
+      // (0x0D = limited resources, usually "already busy"). ESP-IDF adds 0x100 to failures.
+      const auto &c = param->acl_conn_cmpl_stat;
+      ESP_LOGD(TAG, "Radio link to %s: status 0x%02X", bda_to_string(c.bda).c_str(), (unsigned) c.stat);
+      if (c.stat == ESP_BT_STATUS_SUCCESS) {
+        BtEvent e;
+        e.type = BtEvent::ACL_UP;
+        memcpy(e.bda, c.bda, 6);
+        instance_->push_event_(std::move(e));
+      }
+      break;
+    }
     case ESP_BT_GAP_AUTH_CMPL_EVT:
       if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS)
         ESP_LOGD(TAG, "Pairing/authentication OK with %s", bda_to_string(param->auth_cmpl.bda).c_str());
@@ -225,11 +291,20 @@ void SkyrcNC2500::spp_callback_(esp_spp_cb_event_t event, esp_spp_cb_param_t *pa
       e.status = param->disc_comp.status;
       e.scn = param->disc_comp.scn_num > 0 ? param->disc_comp.scn[0] : 0;
       break;
-    case ESP_SPP_OPEN_EVT:
+    case ESP_SPP_OPEN_EVT:  // we opened the channel
       e.type = BtEvent::SPP_OPEN;
       e.status = param->open.status;
       e.handle = param->open.handle;
       break;
+    case ESP_SPP_SRV_OPEN_EVT:  // the charger opened it (on our serial server)
+      e.type = BtEvent::SPP_OPEN;
+      e.status = param->srv_open.status;
+      e.handle = param->srv_open.handle;
+      e.flag = true;
+      break;
+    case ESP_SPP_START_EVT:
+      ESP_LOGD(TAG, "Serial server listening (status %d)", (int) param->start.status);
+      return;
     case ESP_SPP_CLOSE_EVT:
       e.type = BtEvent::SPP_CLOSE;
       e.status = param->close.status;
@@ -254,12 +329,16 @@ void SkyrcNC2500::spp_callback_(esp_spp_cb_event_t event, esp_spp_cb_param_t *pa
 }
 
 // ---------------------------------------------------------------------------------------------
-// Main loop
+// Connection management
 // ---------------------------------------------------------------------------------------------
 
 void SkyrcNC2500::set_state_(State s) {
   this->state_ = s;
   this->state_since_ = millis();
+}
+
+esp_spp_sec_t SkyrcNC2500::spp_security_() const {
+  return this->security_ ? ESP_SPP_SEC_AUTHENTICATE : ESP_SPP_SEC_NONE;
 }
 
 void SkyrcNC2500::publish_connected_(bool c) {
@@ -268,36 +347,46 @@ void SkyrcNC2500::publish_connected_(bool c) {
   this->published_connected_ = true;
 }
 
+// Call the charger again after backoff_ms_, then back off: RETRY_MIN, doubling, up to the cap.
 void SkyrcNC2500::schedule_reconnect_() {
-  // A charger that is switched off is normal. Search gently: 5 s, 10 s, 20 s ... never slower than every 2 minutes (30 s once the address is known)
-  // (each search briefly competes with Wi-Fi for the radio, so we don't hammer it).
   this->next_connect_at_ = millis() + this->backoff_ms_;
-  // With a known address a connect attempt is cheap, so keep trying every 30 s at most; searching is dearer.
-  this->backoff_ms_ = std::min<uint32_t>(this->backoff_ms_ * 2, this->has_mac_ ? 30000 : 120000);
+  const uint32_t cap = this->has_mac_ ? RETRY_MAX_KNOWN_ADDRESS : RETRY_MAX_SEARCH;
+  this->backoff_ms_ = std::min<uint32_t>(this->backoff_ms_ * 2, cap);
   this->set_state_(State::IDLE);
 }
 
+// Every entity shows "not connected" (once per outage, not on every retry).
 void SkyrcNC2500::mark_offline_() {
   if (this->offline_published_)
     return;
   this->offline_published_ = true;
   this->publish_connected_(false);
+  auto clear = [](sensor::Sensor *s) {
+    if (s != nullptr)
+      s->publish_state(NAN);
+  };
+  auto text = [](text_sensor::TextSensor *s, const char *v) {
+    if (s != nullptr)
+      s->publish_state(v);
+  };
   for (auto &s : this->slots_) {
-    if (s.voltage != nullptr) s.voltage->publish_state(NAN);
-    if (s.current != nullptr) s.current->publish_state(NAN);
-    if (s.capacity != nullptr) s.capacity->publish_state(NAN);
-    if (s.temperature != nullptr) s.temperature->publish_state(NAN);
-    if (s.run_time != nullptr) s.run_time->publish_state(NAN);
-    if (s.resistance != nullptr) s.resistance->publish_state(NAN);
-    if (s.cycles != nullptr) s.cycles->publish_state(NAN);
-    if (s.mode != nullptr) s.mode->publish_state("Disconnected");
-    if (s.state != nullptr) s.state->publish_state("Disconnected");
-    if (s.summary != nullptr) s.summary->publish_state("Not connected");
-    if (s.present != nullptr) s.present->publish_state(false);
+    clear(s.voltage);
+    clear(s.current);
+    clear(s.capacity);
+    clear(s.temperature);
+    clear(s.run_time);
+    clear(s.resistance);
+    clear(s.cycles);
+    text(s.mode, "Disconnected");
+    text(s.state, "Disconnected");
+    text(s.summary, "Not connected");
+    if (s.present != nullptr)
+      s.present->publish_state(false);
   }
 }
 
-// The charger is off, out of range, or already connected to the phone: say so once, then retry quietly.
+// A connection attempt failed. The charger is usually just switched off or busy with the phone: say so once per
+// outage, then retry quietly.
 void SkyrcNC2500::note_unreachable_(const char *why) {
   if (!this->outage_logged_) {
     ESP_LOGI(TAG, "Charger not reachable (%s) - probably switched off or busy with the phone. Retrying quietly.", why);
@@ -309,18 +398,28 @@ void SkyrcNC2500::note_unreachable_(const char *why) {
   this->schedule_reconnect_();
 }
 
+// An established connection ended (charger switched off, or stopped answering). Wait for its call.
+void SkyrcNC2500::on_link_lost_(const char *message) {
+  ESP_LOGI(TAG, "%s Will keep looking.", message);
+  this->was_connected_ = false;
+  this->link_dead_ = false;
+  this->outage_logged_ = true;
+  this->mark_offline_();
+  this->backoff_ms_ = WAIT_FOR_CALL_IN;
+  this->schedule_reconnect_();
+}
+
 void SkyrcNC2500::begin_connect_() {
   if (!this->spp_ready_)
     return;
   this->target_known_ = this->has_mac_;
   if (this->has_mac_ && this->channel_cfg_ > 0) {
-    // Address and channel known: connect straight away, like a phone reconnecting to a paired device.
-    // No search is needed, so this works without the charger being in pairing mode.
+    // Address and channel known: call it directly. This only gets through while the charger is listening
+    // (just after a connection, or in pairing mode); otherwise it calls us (see ACL_UP).
     ESP_LOGD(TAG, "Connecting to %s on channel %u", bda_to_string(this->target_bda_).c_str(), this->channel_cfg_);
     this->scn_ = this->channel_cfg_;
     this->set_state_(State::CONNECTING);
-    esp_spp_connect(this->security_ ? ESP_SPP_SEC_AUTHENTICATE : ESP_SPP_SEC_NONE, ESP_SPP_ROLE_MASTER, this->scn_,
-                    this->target_bda_);
+    esp_spp_connect(this->spp_security_(), ESP_SPP_ROLE_MASTER, this->scn_, this->target_bda_);
   } else if (this->has_mac_) {
     ESP_LOGD(TAG, "Looking up the serial service on %s", bda_to_string(this->target_bda_).c_str());
     this->set_state_(State::SDP);
@@ -335,24 +434,47 @@ void SkyrcNC2500::begin_connect_() {
 }
 
 void SkyrcNC2500::disconnect_() {
-  if (this->spp_handle_ != 0) {
+  if (this->spp_handle_ != 0)
     esp_spp_disconnect(this->spp_handle_);
-  }
   if (this->state_ == State::INQUIRY)
     esp_bt_gap_cancel_discovery();
+}
+
+// A serial channel is open (either side opened it): reset every protocol layer and start the handshake.
+void SkyrcNC2500::on_channel_open_(uint32_t handle, bool opened_by_charger) {
+  ESP_LOGD(TAG, "Bluetooth link open (%s), starting handshake",
+           opened_by_charger ? "charger opened it" : "we opened it");
+  this->spp_handle_ = handle;
+  this->congested_ = false;
+  this->tx_queue_.clear();
+  this->lstate_ = 0;
+  this->iq_.clear();
+  this->i_seq_ = 0;
+  this->last_rx_seq_ = 10000;
+  this->channel_open_ = false;
+  this->bstate_ = 0;
+  this->abuf_.clear();
+  this->auth_ok_ = false;
+  this->challenge_attempts_ = 0;
+  this->link_dead_ = false;
+  this->identity_logged_ = false;
+  this->set_state_(State::HANDSHAKE_OPEN);
+  this->enqueue_i_(MODULE_OPEN_CHANNEL, {(uint8_t) (this->chan_id_ >> 8), (uint8_t) (this->chan_id_ & 0xFF), 0x01});
 }
 
 void SkyrcNC2500::handle_event_(BtEvent &e) {
   switch (e.type) {
     case BtEvent::SPP_INIT:
-      if (e.status == ESP_SPP_SUCCESS) {
-        this->spp_ready_ = true;
-        ESP_LOGD(TAG, "Bluetooth serial ready");
-        this->mark_offline_();
-        this->set_state_(State::IDLE);
-      } else {
+      if (e.status != ESP_SPP_SUCCESS) {
         ESP_LOGE(TAG, "SPP init failed (%d)", e.status);
+        break;
       }
+      this->spp_ready_ = true;
+      ESP_LOGD(TAG, "Bluetooth serial ready");
+      // When the charger calls us it opens the serial channel itself, so run a serial server for it.
+      esp_spp_start_srv(this->spp_security_(), ESP_SPP_ROLE_SLAVE, 0, "SPP");
+      this->mark_offline_();
+      this->set_state_(State::IDLE);
       break;
 
     case BtEvent::GAP_FOUND: {
@@ -374,15 +496,16 @@ void SkyrcNC2500::handle_event_(BtEvent &e) {
     }
 
     case BtEvent::GAP_DISC_STOPPED:
-      if (this->state_ == State::INQUIRY) {
-        if (this->target_known_) {
-          this->set_state_(State::SDP);
-          esp_spp_start_discovery(this->target_bda_);
-        } else {
-          if (this->inquiries_ <= 2)
-            ESP_LOGI(TAG, "No charger found yet. If it is listed above under another name, set mac_address: in the config.");
-          this->note_unreachable_("not found nearby");
-        }
+      if (this->state_ != State::INQUIRY)
+        break;
+      if (this->target_known_) {
+        this->set_state_(State::SDP);
+        esp_spp_start_discovery(this->target_bda_);
+      } else {
+        if (this->inquiries_ <= 2)
+          ESP_LOGI(TAG,
+                   "No charger found yet. If it is listed above under another name, set mac_address: in the config.");
+        this->note_unreachable_("not found nearby");
       }
       break;
 
@@ -397,45 +520,35 @@ void SkyrcNC2500::handle_event_(BtEvent &e) {
         ESP_LOGD(TAG, "Serial service lookup failed (%d), trying channel 1", e.status);
       }
       this->set_state_(State::CONNECTING);
-      esp_spp_connect(this->security_ ? ESP_SPP_SEC_AUTHENTICATE : ESP_SPP_SEC_NONE, ESP_SPP_ROLE_MASTER, this->scn_,
-                      this->target_bda_);
+      esp_spp_connect(this->spp_security_(), ESP_SPP_ROLE_MASTER, this->scn_, this->target_bda_);
       break;
 
     case BtEvent::SPP_OPEN:
-      if (e.status == ESP_SPP_SUCCESS) {
-        ESP_LOGD(TAG, "Bluetooth link open, starting handshake");
-        this->spp_handle_ = e.handle;
-        this->congested_ = false;
-        this->lstate_ = 0;
-        this->abuf_.clear();
-        this->tx_queue_.clear();
-        this->auth_ok_ = false;
-        this->info_index_ = 0;
-        this->challenge_attempts_ = 0;
-        this->iq_.clear();
-        this->i_seq_ = 0;
-        this->last_rx_seq_ = 10000;
-        this->channel_open_ = false;
-        this->bstate_ = 0;
-        this->set_state_(State::HANDSHAKE_OPEN);
-        this->enqueue_i_(0x3F, {(uint8_t) (this->chan_id_ >> 8), (uint8_t) (this->chan_id_ & 0xFF), 0x01});
-      } else {
+      if (e.status != ESP_SPP_SUCCESS) {
         this->note_unreachable_("connect refused");
+      } else if (!this->enabled_) {
+        esp_spp_disconnect(e.handle);  // released for the phone app
+      } else if (this->spp_handle_ != 0 && e.handle != this->spp_handle_) {
+        // Both sides opened a channel at once; keep the first one.
+        ESP_LOGD(TAG, "Second serial channel opened, closing it");
+        esp_spp_disconnect(e.handle);
+      } else {
+        this->on_channel_open_(e.handle, e.flag);
       }
       break;
 
     case BtEvent::SPP_CLOSE:
+      if (this->spp_handle_ != 0 && e.handle != this->spp_handle_) {
+        ESP_LOGD(TAG, "Spare serial channel closed (status %d)", e.status);
+        break;
+      }
       this->spp_handle_ = 0;
       this->tx_queue_.clear();
       this->iq_.clear();
       if (this->was_connected_) {
-        ESP_LOGI(TAG, "Charger disconnected (switched off?). Will keep looking.");
-        this->was_connected_ = false;
-        this->outage_logged_ = true;
-        this->mark_offline_();
-        this->backoff_ms_ = 10000;
-        this->schedule_reconnect_();
+        this->on_link_lost_("Charger disconnected (switched off?).");
       } else if (this->state_ != State::IDLE) {
+        ESP_LOGD(TAG, "Serial channel closed (status %d)", e.status);
         this->note_unreachable_("link dropped during setup");
       }
       break;
@@ -446,6 +559,17 @@ void SkyrcNC2500::handle_event_(BtEvent &e) {
 
     case BtEvent::SPP_CONG:
       this->congested_ = e.flag;
+      break;
+
+    case BtEvent::ACL_UP:
+      // The charger called us (it was just switched on). It normally opens the serial channel itself within a
+      // second (SPP_OPEN); if it doesn't, we open it ourselves over this radio link after CALL_IN_GRACE.
+      if (this->state_ == State::IDLE && this->enabled_ && this->spp_ready_ && this->has_mac_ &&
+          memcmp(e.bda, this->target_bda_, 6) == 0) {
+        ESP_LOGI(TAG, "Charger %s called in", bda_to_string(e.bda).c_str());
+        this->backoff_ms_ = RETRY_MIN;
+        this->next_connect_at_ = millis() + CALL_IN_GRACE;
+      }
       break;
   }
 }
@@ -462,6 +586,15 @@ void SkyrcNC2500::loop() {
   const uint32_t now = millis();
   const uint32_t in_state = now - this->state_since_;
 
+  // Accept the charger's calls as the link's master. Only the master sets the link supervision timeout (how long
+  // a silent link lives); as master, Bluedroid applies its own 5 s. As slave the charger's much longer one applies,
+  // and after a quick off/on the dead link then lingers for a minute or more, blocking every reconnect.
+  // ESP-IDF has no public API for this, and Bluedroid resets it on every link change, so re-assert it here.
+  if (this->spp_ready_ && now - this->last_role_set_ >= ROLE_REASSERT) {
+    this->last_role_set_ = now;
+    L2CA_SetDesireRole(HCI_ROLE_MASTER);
+  }
+
   switch (this->state_) {
     case State::STARTING:
     case State::FAILED:
@@ -474,22 +607,20 @@ void SkyrcNC2500::loop() {
       break;
 
     case State::INQUIRY:
-      if (in_state > 20000) {
+      if (in_state > INQUIRY_TIMEOUT) {
         esp_bt_gap_cancel_discovery();
         this->note_unreachable_("search timed out");
       }
       break;
 
     case State::SDP:
-      if (in_state > 15000) {
+      if (in_state > SDP_TIMEOUT)
         this->note_unreachable_("lookup timed out");
-      }
       break;
 
     case State::CONNECTING:
-      if (in_state > 20000) {
-        if (this->spp_handle_ != 0)
-          esp_spp_disconnect(this->spp_handle_);
+      if (in_state > CONNECT_TIMEOUT) {
+        this->disconnect_();
         this->note_unreachable_("connect timed out");
       }
       break;
@@ -497,13 +628,12 @@ void SkyrcNC2500::loop() {
     case State::HANDSHAKE_OPEN:
       if (this->channel_open_) {
         this->set_state_(State::HANDSHAKE_INFO);
-      } else if (in_state > 8000) {
+      } else if (in_state > MODULE_TIMEOUT) {
         if (!this->warned_silent_) {
           ESP_LOGW(TAG, "Connected, but the charger's module did not answer. Giving up for now.");
           this->warned_silent_ = true;
         }
-        if (this->spp_handle_ != 0)
-          esp_spp_disconnect(this->spp_handle_);
+        this->disconnect_();
         this->note_unreachable_("module not answering");
       }
       break;
@@ -515,18 +645,17 @@ void SkyrcNC2500::loop() {
       break;
 
     case State::HANDSHAKE_INFO_WAIT:
-      if (this->iq_.empty() && in_state > 1500) {
+      if (this->iq_.empty() && in_state > INFO_SETTLE) {
         this->send_session_(CMD_MODE, {0x01, 0x09});
         this->set_state_(State::HANDSHAKE_MODE);
-      } else if (in_state > 15000) {
+      } else if (in_state > INFO_TIMEOUT) {
+        this->disconnect_();
         this->note_unreachable_("setup stalled");
-        if (this->spp_handle_ != 0)
-          esp_spp_disconnect(this->spp_handle_);
       }
       break;
 
     case State::HANDSHAKE_MODE:
-      if (this->iq_.empty() && in_state > 800) {
+      if (this->iq_.empty() && in_state > MODE_SETTLE) {
         if (this->skip_auth_check_) {
           this->set_state_(State::READY);
           this->last_poll_ = 0;
@@ -542,8 +671,8 @@ void SkyrcNC2500::loop() {
       if (this->auth_ok_) {
         this->set_state_(State::READY);
         this->last_poll_ = 0;
-      } else if (in_state > 1500) {
-        if (this->challenge_attempts_ < 3) {
+      } else if (in_state > CHALLENGE_RETRY) {
+        if (this->challenge_attempts_ < CHALLENGE_TRIES) {
           this->challenge_attempts_++;
           this->send_challenge_();
           this->state_since_ = now;
@@ -562,6 +691,7 @@ void SkyrcNC2500::loop() {
 
     case State::READY:
       if (this->last_poll_ == 0) {
+        // Just connected
         if (this->outage_logged_ || !this->published_connected_)
           ESP_LOGI(TAG, "Charger connected");
         this->outage_logged_ = false;
@@ -569,24 +699,25 @@ void SkyrcNC2500::loop() {
         this->was_connected_ = true;
         this->last_rx_ms_ = now;
         this->publish_connected_(true);
-        this->backoff_ms_ = 5000;
+        this->backoff_ms_ = RETRY_MIN;
         this->send_query_version_();
-        this->last_poll_ = now;
         this->send_query_status_();
+        this->last_poll_ = now;
+        this->last_keepalive_ = now;
       } else if (now - this->last_poll_ >= this->poll_interval_ms_) {
-        this->last_poll_ = now;
         this->send_query_status_();
+        this->last_poll_ = now;
+        this->last_keepalive_ = now;
+      } else if (this->iq_.empty() && now - this->last_keepalive_ >= KEEPALIVE_INTERVAL) {
+        // Between polls, a cheap query that updates no sensors. If the charger is switched off we notice within
+        // seconds, before it comes back on and calls us while we still hold the dead link.
+        this->send_query_version_();
+        this->last_keepalive_ = now;
       }
-      // Connected but silent (charger switched off while the link was up): let go quietly and start searching again.
-      if (now - this->last_rx_ms_ > std::max<uint32_t>(this->poll_interval_ms_ * 4, 60000)) {
-        ESP_LOGI(TAG, "Charger stopped answering. Will keep looking.");
-        this->was_connected_ = false;
-        this->outage_logged_ = true;
-        this->mark_offline_();
-        if (this->spp_handle_ != 0)
-          esp_spp_disconnect(this->spp_handle_);
-        this->backoff_ms_ = 10000;
-        this->schedule_reconnect_();
+      if (this->link_dead_ ||
+          now - this->last_rx_ms_ > std::max<uint32_t>(this->poll_interval_ms_ * 3, MIN_SILENCE_TIMEOUT)) {
+        this->disconnect_();
+        this->on_link_lost_("Charger stopped answering.");
       }
       break;
   }
@@ -596,7 +727,7 @@ void SkyrcNC2500::loop() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Link layer
+// Link layer: 55 | len | payload | checksum (a zero length byte means a 16-bit length follows)
 // ---------------------------------------------------------------------------------------------
 
 uint8_t SkyrcNC2500::link_checksum_(const uint8_t *p, size_t n) {
@@ -617,7 +748,7 @@ std::string SkyrcNC2500::hex_(const uint8_t *d, size_t n) const {
 }
 
 void SkyrcNC2500::queue_tx_(std::vector<uint8_t> &&frame) {
-  if (this->tx_queue_.size() < 32)
+  if (this->tx_queue_.size() < MAX_TX_FRAMES)
     this->tx_queue_.push_back(std::move(frame));
 }
 
@@ -625,7 +756,7 @@ void SkyrcNC2500::pump_tx_() {
   if (this->spp_handle_ == 0 || this->tx_queue_.empty() || this->congested_)
     return;
   const uint32_t now = millis();
-  if (now - this->last_tx_ < 25)
+  if (now - this->last_tx_ < TX_SPACING)
     return;
   auto &f = this->tx_queue_.front();
   esp_err_t err = esp_spp_write(this->spp_handle_, f.size(), f.data());
@@ -653,46 +784,73 @@ void SkyrcNC2500::send_link_(const uint8_t *payload, size_t n) {
   this->queue_tx_(std::move(f));
 }
 
-void SkyrcNC2500::send_session_(uint8_t cmd, const std::vector<uint8_t> &data) {
-  std::vector<uint8_t> p;
-  p.reserve(data.size() + 2);
-  p.push_back(SESSION_ID);
-  p.push_back(cmd);
-  p.insert(p.end(), data.begin(), data.end());
-  this->send_channel_(p);
+void SkyrcNC2500::feed_link_(const uint8_t *data, size_t len) {
+  // lstate_: 0 = start byte, 1 = length, 2 = length high, 3 = length low, 4 = payload, 5 = checksum
+  for (size_t i = 0; i < len; i++) {
+    const uint8_t b = data[i];
+    switch (this->lstate_) {
+      case 0:
+        if (b == LINK_SOF)
+          this->lstate_ = 1;
+        break;
+      case 1:
+        if (b == 0) {
+          this->lstate_ = 2;
+        } else if (b > 252) {
+          this->lstate_ = 0;
+        } else {
+          this->lexpect_ = b;
+          this->lgot_ = 0;
+          this->lbuf_.assign(b, 0);
+          this->lstate_ = 4;
+        }
+        break;
+      case 2:
+        this->lexpect_ = (uint16_t) b << 8;
+        this->lstate_ = 3;
+        break;
+      case 3:
+        this->lexpect_ += b;
+        if (this->lexpect_ == 0 || this->lexpect_ > 300) {
+          this->lstate_ = 0;
+        } else {
+          this->lgot_ = 0;
+          this->lbuf_.assign(this->lexpect_, 0);
+          this->lstate_ = 4;
+        }
+        break;
+      case 4:
+        this->lbuf_[this->lgot_++] = b;
+        if (this->lgot_ >= this->lexpect_)
+          this->lstate_ = 5;
+        break;
+      case 5:
+        if (link_checksum_(this->lbuf_.data(), this->lexpect_) == b) {
+          this->handle_link_payload_(this->lbuf_.data(), this->lexpect_);
+        } else {
+          ESP_LOGD(TAG, "Dropped a frame with a bad checksum");
+        }
+        this->lstate_ = 0;
+        break;
+    }
+  }
+}
+
+void SkyrcNC2500::handle_link_payload_(const uint8_t *p, size_t n) {
+  this->last_rx_ms_ = millis();
+  if (this->log_frames_)
+    ESP_LOGI(TAG, "RX %s", this->hex_(p, n).c_str());
+  if (n >= 4 && p[0] == 0x00)
+    this->handle_i_frame_(p, n);
 }
 
 // ---------------------------------------------------------------------------------------------
-// Adapter + module layers
+// Module layer: 00 | cmd | seq(2) | data. Numbered messages; only the oldest unacknowledged one is on the wire.
 // ---------------------------------------------------------------------------------------------
-
-uint8_t SkyrcNC2500::b_checksum_(const uint8_t *d, size_t n) {
-  const bool is_long = n + 4 >= 256;
-  uint8_t sum = (uint8_t) (n & 0xFF) + (uint8_t) ((n >> 8) & 0xFF) + (is_long ? 90 : 88);
-  for (size_t i = 0; i < n; i++)
-    sum += d[i];
-  return (uint8_t) (~sum + 1);
-}
-
-// Wrap a session message as 95 19 | total | message | checksum and send it as numbered data on our channel.
-void SkyrcNC2500::send_channel_(const std::vector<uint8_t> &message) {
-  if (message.size() + 4 >= 256 || message.size() > 118)
-    return;  // we never build anything this big
-  std::vector<uint8_t> payload;
-  payload.reserve(message.size() + 7);
-  payload.push_back((uint8_t) (this->chan_id_ >> 8));
-  payload.push_back((uint8_t) (this->chan_id_ & 0xFF));
-  payload.push_back(0x95);
-  payload.push_back(0x19);
-  payload.push_back((uint8_t) (message.size() + 4));
-  payload.insert(payload.end(), message.begin(), message.end());
-  payload.push_back(b_checksum_(message.data(), message.size()));
-  this->enqueue_i_(0x43, payload);
-}
 
 void SkyrcNC2500::enqueue_i_(uint8_t cmd, const std::vector<uint8_t> &data) {
-  if (this->iq_.size() >= 24)
-    return;  // the charger isn't keeping up; drop rather than pile up
+  if (this->iq_.size() >= MAX_MODULE_MESSAGES)
+    return;
   IItem it;
   it.cmd = cmd;
   it.frame.reserve(data.size() + 4);
@@ -705,30 +863,31 @@ void SkyrcNC2500::enqueue_i_(uint8_t cmd, const std::vector<uint8_t> &data) {
   this->iq_.push_back(std::move(it));
 }
 
-// Only the first message in the queue is on the wire; it is resent every 500 ms until acknowledged.
 void SkyrcNC2500::pump_i_() {
   if (this->iq_.empty() || this->spp_handle_ == 0)
     return;
   auto &it = this->iq_.front();
   const uint32_t now = millis();
-  if (it.tries == 0 || now - it.last_sent >= 500) {
-    if (it.tries >= 20) {
-      ESP_LOGD(TAG, "No acknowledgement after %u tries, dropping", it.tries);
-      this->iq_.pop_front();
-      return;
-    }
-    it.tries++;
-    it.last_sent = now;
-    this->send_link_(it.frame.data(), it.frame.size());
+  if (it.tries != 0 && now - it.last_sent < ACK_RESEND)
+    return;
+  if (it.tries >= ACK_MAX_TRIES) {
+    ESP_LOGD(TAG, "No acknowledgement after %u tries, dropping", it.tries);
+    this->iq_.pop_front();
+    // On an established link that means the charger has gone (switched off); loop() lets go of it.
+    if (this->state_ == State::READY)
+      this->link_dead_ = true;
+    return;
   }
+  it.tries++;
+  it.last_sent = now;
+  this->send_link_(it.frame.data(), it.frame.size());
 }
 
 void SkyrcNC2500::handle_i_frame_(const uint8_t *p, size_t n) {
-  // p = 00 | cmd | seq(2) | ...
   const uint8_t cmd = p[1];
   const uint16_t seq = (uint16_t) (p[2] << 8) | p[3];
-  if (cmd == 0x42) {
-    // Data from the charger on a channel. Acknowledge it, and pass it on once.
+  if (cmd == MODULE_CHANNEL_DATA_IN) {
+    // Data from the charger on a channel: acknowledge it, and pass it on once (it repeats until acknowledged).
     uint8_t result = 1;  // unknown channel
     if (n >= 6) {
       const uint16_t chan = (uint16_t) (p[4] << 8) | p[5];
@@ -742,38 +901,59 @@ void SkyrcNC2500::handle_i_frame_(const uint8_t *p, size_t n) {
         result = 2;  // channel not open yet
       }
     }
-    const uint8_t ack[6] = {0x00, 0x02, p[2], p[3], result, 0x42};
+    const uint8_t ack[6] = {0x00, 0x02, p[2], p[3], result, MODULE_CHANNEL_DATA_IN};
     this->send_link_(ack, sizeof(ack));
     return;
   }
+
+  // Otherwise it may acknowledge our oldest message: either a generic ack (41 ... result cmd) or a reply
+  // command one higher than ours.
   if (this->iq_.empty())
     return;
   auto &head = this->iq_.front();
   const uint16_t head_seq = (uint16_t) (head.frame[2] << 8) | head.frame[3];
   if (seq != head_seq)
     return;
-  bool acked = false;
   bool ok = true;
-  if (cmd == 0x41 && n >= 6 && p[5] == head.cmd) {
-    acked = true;
+  if (cmd == MODULE_ACK && n >= 6 && p[5] == head.cmd) {
     ok = p[4] == 0;
-  } else if (cmd == (uint8_t) (head.cmd + 1)) {
-    acked = true;
-  }
-  if (!acked)
+  } else if (cmd != (uint8_t) (head.cmd + 1)) {
     return;
-  if (head.cmd == 0x3F) {
-    if (ok) {
-      this->channel_open_ = true;
-      ESP_LOGD(TAG, "Data channel open");
-    } else {
-      ESP_LOGD(TAG, "Charger module refused the data channel");
-    }
+  }
+  if (head.cmd == MODULE_OPEN_CHANNEL) {
+    this->channel_open_ = ok;
+    ESP_LOGD(TAG, ok ? "Data channel open" : "Charger module refused the data channel");
   }
   this->iq_.pop_front();
 }
 
-// Adapter stream parser: 95 19 | len | message | checksum (a zero length byte means a 16-bit length follows).
+// ---------------------------------------------------------------------------------------------
+// Adapter layer: 95 19 | len | message | checksum, carried as module data on our channel
+// ---------------------------------------------------------------------------------------------
+
+uint8_t SkyrcNC2500::b_checksum_(const uint8_t *d, size_t n) {
+  const bool is_long = n + 4 >= 256;
+  uint8_t sum = (uint8_t) (n & 0xFF) + (uint8_t) ((n >> 8) & 0xFF) + (is_long ? 90 : 88);
+  for (size_t i = 0; i < n; i++)
+    sum += d[i];
+  return (uint8_t) (~sum + 1);
+}
+
+void SkyrcNC2500::send_channel_(const std::vector<uint8_t> &message) {
+  if (message.size() > 118)
+    return;  // we never build anything this big (it would need the long form)
+  std::vector<uint8_t> payload;
+  payload.reserve(message.size() + 7);
+  payload.push_back((uint8_t) (this->chan_id_ >> 8));
+  payload.push_back((uint8_t) (this->chan_id_ & 0xFF));
+  payload.push_back(0x95);
+  payload.push_back(0x19);
+  payload.push_back((uint8_t) (message.size() + 4));
+  payload.insert(payload.end(), message.begin(), message.end());
+  payload.push_back(b_checksum_(message.data(), message.size()));
+  this->enqueue_i_(MODULE_CHANNEL_DATA_OUT, payload);
+}
+
 void SkyrcNC2500::feed_b_(const uint8_t *data, size_t len) {
   // bstate_: 0 = 0x95, 1 = 0x19, 2 = length, 3 = length high, 4 = length low, 5 = message, 6 = checksum
   for (size_t i = 0; i < len; i++) {
@@ -831,72 +1011,17 @@ void SkyrcNC2500::feed_b_(const uint8_t *data, size_t len) {
   }
 }
 
-void SkyrcNC2500::send_rfa_(const std::vector<uint8_t> &data) {
+// ---------------------------------------------------------------------------------------------
+// Session layer: 1B | cmd | data
+// ---------------------------------------------------------------------------------------------
+
+void SkyrcNC2500::send_session_(uint8_t cmd, const std::vector<uint8_t> &data) {
   std::vector<uint8_t> p;
-  p.push_back(RFA_TYPE);
-  p.push_back((uint8_t) data.size());
+  p.reserve(data.size() + 2);
+  p.push_back(SESSION_ID);
+  p.push_back(cmd);
   p.insert(p.end(), data.begin(), data.end());
-  this->send_session_(CMD_RFA_WRITE, p);
-}
-
-void SkyrcNC2500::feed_link_(const uint8_t *data, size_t len) {
-  // lstate_: 0 = start byte, 1 = length, 2 = length high, 3 = length low, 4 = payload, 5 = checksum
-  for (size_t i = 0; i < len; i++) {
-    uint8_t b = data[i];
-    switch (this->lstate_) {
-      case 0:
-        if (b == LINK_SOF)
-          this->lstate_ = 1;
-        break;
-      case 1:
-        if (b == 0) {
-          this->lstate_ = 2;
-        } else if (b > 252) {
-          this->lstate_ = 0;
-        } else {
-          this->lexpect_ = b;
-          this->lgot_ = 0;
-          this->lbuf_.assign(b, 0);
-          this->lstate_ = 4;
-        }
-        break;
-      case 2:
-        this->lexpect_ = (uint16_t) b << 8;
-        this->lstate_ = 3;
-        break;
-      case 3:
-        this->lexpect_ += b;
-        if (this->lexpect_ == 0 || this->lexpect_ > 300) {
-          this->lstate_ = 0;
-        } else {
-          this->lgot_ = 0;
-          this->lbuf_.assign(this->lexpect_, 0);
-          this->lstate_ = 4;
-        }
-        break;
-      case 4:
-        this->lbuf_[this->lgot_++] = b;
-        if (this->lgot_ >= this->lexpect_)
-          this->lstate_ = 5;
-        break;
-      case 5:
-        if (link_checksum_(this->lbuf_.data(), this->lexpect_) == b) {
-          this->handle_link_payload_(this->lbuf_.data(), this->lexpect_);
-        } else {
-          ESP_LOGD(TAG, "Dropped a frame with a bad checksum");
-        }
-        this->lstate_ = 0;
-        break;
-    }
-  }
-}
-
-void SkyrcNC2500::handle_link_payload_(const uint8_t *p, size_t n) {
-  this->last_rx_ms_ = millis();
-  if (this->log_frames_)
-    ESP_LOGI(TAG, "RX %s", this->hex_(p, n).c_str());
-  if (n >= 4 && p[0] == 0x00)
-    this->handle_i_frame_(p, n);
+  this->send_channel_(p);
 }
 
 void SkyrcNC2500::handle_session_(const uint8_t *p, size_t n) {
@@ -904,7 +1029,7 @@ void SkyrcNC2500::handle_session_(const uint8_t *p, size_t n) {
     ESP_LOGI(TAG, "Session message: %s", this->hex_(p, n).c_str());
   if (n < 2 || p[0] != SESSION_ID)
     return;
-  uint8_t cmd = p[1];
+  const uint8_t cmd = p[1];
   if (cmd == CMD_CHALLENGE_REPLY && n >= 18) {
     uint8_t expect[16];
     compute_response_(this->challenge_, expect);
@@ -915,17 +1040,14 @@ void SkyrcNC2500::handle_session_(const uint8_t *p, size_t n) {
       ESP_LOGD(TAG, "Challenge answer differs from the expected one: %s", this->hex_(p + 2, 16).c_str());
     }
   } else if (cmd == CMD_RFA_DATA && n >= 5 && (p[2] == 0x00 || p[2] == 0x80)) {
-    size_t dlen = std::min<size_t>(p[4], n - 5);
+    const size_t dlen = std::min<size_t>(p[4], n - 5);
     this->feed_app_(p + 5, dlen);
   }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Challenge (the charger proves it is genuine; we can also just skip it)
-// ---------------------------------------------------------------------------------------------
-
+// The charger proves it is genuine by answering a random challenge (skip_auth_check skips this).
 static void rotate_right_128(uint8_t *a) {
-  uint8_t carry = a[15] & 1;
+  const uint8_t carry = a[15] & 1;
   for (int i = 15; i >= 1; i--)
     a[i] = (uint8_t) ((a[i] >> 1) | ((a[i - 1] & 1) << 7));
   a[0] = (uint8_t) ((a[0] >> 1) | (carry << 7));
@@ -933,7 +1055,7 @@ static void rotate_right_128(uint8_t *a) {
 
 void SkyrcNC2500::compute_response_(const uint8_t *challenge, uint8_t *out) {
   memcpy(out, challenge, 16);
-  uint32_t k[2] = {557064756u, 664220296u};
+  const uint32_t k[2] = {557064756u, 664220296u};
   for (uint32_t word : k) {
     for (int bit = 0; bit < 32; bit++) {
       if (word & 1) {
@@ -948,15 +1070,23 @@ void SkyrcNC2500::compute_response_(const uint8_t *challenge, uint8_t *out) {
 
 void SkyrcNC2500::send_challenge_() {
   for (int i = 0; i < 16; i += 4) {
-    uint32_t r = esp_random();
+    const uint32_t r = esp_random();
     memcpy(this->challenge_ + i, &r, 4);
   }
   this->send_session_(CMD_CHALLENGE, std::vector<uint8_t>(this->challenge_, this->challenge_ + 16));
 }
 
 // ---------------------------------------------------------------------------------------------
-// Charger frames
+// Charger frames: 0F | len | cmd | ... | checksum | FF FF, carried in session RFA messages
 // ---------------------------------------------------------------------------------------------
+
+void SkyrcNC2500::send_rfa_(const std::vector<uint8_t> &data) {
+  std::vector<uint8_t> p;
+  p.push_back(RFA_TYPE);
+  p.push_back((uint8_t) data.size());
+  p.insert(p.end(), data.begin(), data.end());
+  this->send_session_(CMD_RFA_WRITE, p);
+}
 
 void SkyrcNC2500::send_query_status_() { this->send_rfa_({0x0F, 0x03, 0x55, 0x00, 0x55, 0xFF, 0xFF}); }
 void SkyrcNC2500::send_query_version_() { this->send_rfa_({0x0F, 0x03, 0x57, 0x00, 0x57, 0xFF, 0xFF}); }
@@ -972,7 +1102,7 @@ void SkyrcNC2500::feed_app_(const uint8_t *data, size_t len) {
     }
     if (this->abuf_.size() < 2)
       return;
-    size_t total = (size_t) this->abuf_[1] + 4;
+    const size_t total = (size_t) this->abuf_[1] + 4;
     if (total < 5 || total > 200) {
       this->abuf_.erase(this->abuf_.begin());
       continue;
@@ -989,8 +1119,10 @@ void SkyrcNC2500::handle_app_frame_(const uint8_t *f, size_t n) {
     ESP_LOGI(TAG, "Charger frame (%u bytes): %s", (unsigned) n, this->hex_(f, n).c_str());
   if (n == 4 + NUM_SLOTS * SLOT_RECORD_LEN + 3) {
     this->parse_status_(f, n);
-  } else if (f[2] == 0x57) {
+  } else if (f[2] == 0x57 && !this->identity_logged_) {
+    // The keepalive asks for this every few seconds; log it once per connection.
     ESP_LOGI(TAG, "Charger identity: %s", this->hex_(f + 2, n - 2).c_str());
+    this->identity_logged_ = true;
   }
 }
 
@@ -1002,6 +1134,7 @@ void SkyrcNC2500::parse_status_(const uint8_t *f, size_t n) {
     ESP_LOGD(TAG, "Status checksum mismatch (got %02X, expected %02X) - using it anyway", f[n - 3], sum);
 
   for (uint8_t i = 0; i < NUM_SLOTS; i++) {
+    // Slot record layout: docs/protocol.md, "Status reply"
     const uint8_t *r = f + 4 + i * SLOT_RECORD_LEN;
     const uint8_t mode = r[0];
     const bool present = r[1] != 0;
@@ -1021,14 +1154,21 @@ void SkyrcNC2500::parse_status_(const uint8_t *f, size_t n) {
       state_s = "Empty";
     }
     if (this->log_frames_)
-      ESP_LOGI(TAG, "Slot %u: %s, mode %s, state %s, %.3f V, %.3f A, %.0f mAh, %.0f s, %.0f C, cycle %.0f, %.0f mOhm", i + 1,
-               present ? "battery" : "empty", mode_s, state_s, volts, amps, mah, secs, temp, cycles, milliohm);
+      ESP_LOGI(TAG, "Slot %u: %s, mode %s, state %s, %.3f V, %.3f A, %.0f mAh, %.0f s, %.0f C, cycle %.0f, %.0f mOhm",
+               i + 1, present ? "battery" : "empty", mode_s, state_s, volts, amps, mah, secs, temp, cycles, milliohm);
 
     this->slot_present_[i] = present;
     auto &s = this->slots_[i];
-    if (s.present != nullptr) s.present->publish_state(present);
-    if (s.mode != nullptr) s.mode->publish_state(mode_s);
-    if (s.state != nullptr) s.state->publish_state(state_s);
+    auto value = [present](sensor::Sensor *sensor, float v) {
+      if (sensor != nullptr)
+        sensor->publish_state(present ? v : NAN);
+    };
+    if (s.present != nullptr)
+      s.present->publish_state(present);
+    if (s.mode != nullptr)
+      s.mode->publish_state(mode_s);
+    if (s.state != nullptr)
+      s.state->publish_state(state_s);
     if (s.summary != nullptr) {
       // One short line for dashboards, e.g. "Charging 1.35 V 0.20 A 148 mAh"
       char line[64];
@@ -1040,17 +1180,21 @@ void SkyrcNC2500::parse_status_(const uint8_t *f, size_t n) {
         snprintf(line, sizeof(line), "%s %.2f V %.0f mAh", state_s, volts, mah);
       s.summary->publish_state(line);
     }
-    if (s.voltage != nullptr) s.voltage->publish_state(present ? volts : NAN);
-    if (s.current != nullptr) s.current->publish_state(present ? amps : NAN);
-    if (s.capacity != nullptr) s.capacity->publish_state(present ? mah : NAN);
-    if (s.temperature != nullptr) s.temperature->publish_state(present ? temp : NAN);
-    if (s.run_time != nullptr) s.run_time->publish_state(present ? secs / 60.0f : NAN);
-    if (s.resistance != nullptr) s.resistance->publish_state(present ? milliohm : NAN);
-    if (s.cycles != nullptr) s.cycles->publish_state(present ? cycles : NAN);
+    value(s.voltage, volts);
+    value(s.current, amps);
+    value(s.capacity, mah);
+    value(s.temperature, temp);
+    value(s.run_time, secs / 60.0f);
+    value(s.resistance, milliohm);
+    value(s.cycles, cycles);
   }
 }
 
-// Limits and steps are the ones the vendor app enforces.
+// ---------------------------------------------------------------------------------------------
+// Slot commands. Set-slot: 0F 0D 05 <slot> <mode> <charge mA (2)> <discharge mA (2)> <capacity mAh (2)> <cycles>
+// 00 00 <checksum> FF FF. Limits and steps are the ones the vendor app enforces.
+// ---------------------------------------------------------------------------------------------
+
 static float clamp_step(float v, float lo, float hi, float step) {
   if (std::isnan(v))
     v = lo;
@@ -1058,25 +1202,49 @@ static float clamp_step(float v, float lo, float hi, float step) {
   return std::round(v / step) * step;
 }
 
-bool SkyrcNC2500::apply_slot(uint8_t slot, const std::string &mode, float charge_a, float discharge_a,
-                             float capacity_mah, float cycles) {
+bool SkyrcNC2500::check_slot_command_(uint8_t slot, const char *action) {
   if (slot >= NUM_SLOTS)
     return false;
   if (this->state_ != State::READY) {
-    ESP_LOGW(TAG, "Slot %u: not applied - the charger is not connected", slot + 1);
+    ESP_LOGW(TAG, "Slot %u: not %s - the charger is not connected", slot + 1, action);
     return false;
   }
   if (!this->slot_present_[slot]) {
-    ESP_LOGW(TAG, "Slot %u: not applied - there is no battery in it", slot + 1);
+    ESP_LOGW(TAG, "Slot %u: not %s - there is no battery in it", slot + 1, action);
     return false;
   }
+  return true;
+}
+
+// Fill in the checksum and trailer of a 17-byte set-slot packet and send it.
+void SkyrcNC2500::send_set_slot_(uint8_t *p) {
+  uint8_t sum = 0;
+  for (int i = 2; i < 14; i++)
+    sum += p[i];
+  p[14] = sum;
+  p[15] = 0xFF;
+  p[16] = 0xFF;
+  this->send_rfa_(std::vector<uint8_t>(p, p + 17));
+  // Ask for the new state shortly afterwards instead of waiting for the next poll.
+  this->last_poll_ = millis() - this->poll_interval_ms_ + STATUS_AFTER_COMMAND;
+}
+
+bool SkyrcNC2500::apply_slot(uint8_t slot, const std::string &mode, float charge_a, float discharge_a,
+                             float capacity_mah, float cycles) {
+  if (!this->check_slot_command_(slot, "applied"))
+    return false;
   uint8_t mode_id;
-  if (mode == "Charge") mode_id = 0;
-  else if (mode == "Refresh") mode_id = 1;
-  else if (mode == "Break-In") mode_id = 2;
-  else if (mode == "Discharge") mode_id = 3;
-  else if (mode == "Cycle") mode_id = 4;
-  else {
+  if (mode == "Charge") {
+    mode_id = 0;
+  } else if (mode == "Refresh") {
+    mode_id = 1;
+  } else if (mode == "Break-In") {
+    mode_id = 2;
+  } else if (mode == "Discharge") {
+    mode_id = 3;
+  } else if (mode == "Cycle") {
+    mode_id = 4;
+  } else {
     ESP_LOGW(TAG, "Slot %u: not applied - unknown mode '%s'", slot + 1, mode.c_str());
     return false;
   }
@@ -1085,71 +1253,41 @@ bool SkyrcNC2500::apply_slot(uint8_t slot, const std::string &mode, float charge
   const uint16_t dis = (uint16_t) clamp_step(discharge_a * 1000.0f, 100, 1000, 100);
   const uint16_t cap = (uint16_t) clamp_step(capacity_mah, 500, 3500, 100);
   const uint8_t cyc = (uint8_t) clamp_step(cycles, 1, 12, 1);
+  const bool uses_charge = mode_id == 0 || mode_id == 1 || mode_id == 4;     // Charge, Refresh, Cycle
+  const bool uses_discharge = mode_id == 1 || mode_id == 3 || mode_id == 4;  // Refresh, Discharge, Cycle
+  const bool uses_capacity = mode_id == 2;                                   // Break-In
+  const bool uses_cycles = mode_id == 4;                                     // Cycle
 
-  // 0F 0D 05 <slot> <mode> <v1 hi lo> <v2 hi lo> <v3 hi lo> <cycles> 00 00 <chk> FF FF
   uint8_t p[17] = {0x0F, 0x0D, 0x05, slot, mode_id};
-  switch (mode_id) {
-    case 0:  // Charge
-      p[5] = chg >> 8; p[6] = chg & 0xFF;
-      break;
-    case 1:  // Refresh: charge, then discharge
-      p[5] = chg >> 8; p[6] = chg & 0xFF;
-      p[7] = dis >> 8; p[8] = dis & 0xFF;
-      break;
-    case 2:  // Break-In: needs the rated capacity
-      p[9] = cap >> 8; p[10] = cap & 0xFF;
-      break;
-    case 3:  // Discharge
-      p[7] = dis >> 8; p[8] = dis & 0xFF;
-      break;
-    case 4:  // Cycle: charge, discharge, number of cycles
-      p[5] = chg >> 8; p[6] = chg & 0xFF;
-      p[7] = dis >> 8; p[8] = dis & 0xFF;
-      p[11] = cyc;
-      break;
+  if (uses_charge) {
+    p[5] = chg >> 8;
+    p[6] = chg & 0xFF;
   }
-  uint8_t sum = 0;
-  for (int i = 2; i < 14; i++)
-    sum += p[i];
-  p[14] = sum;
-  p[15] = 0xFF;
-  p[16] = 0xFF;
+  if (uses_discharge) {
+    p[7] = dis >> 8;
+    p[8] = dis & 0xFF;
+  }
+  if (uses_capacity) {
+    p[9] = cap >> 8;
+    p[10] = cap & 0xFF;
+  }
+  if (uses_cycles)
+    p[11] = cyc;
 
   ESP_LOGI(TAG, "Slot %u: starting %s (charge %u mA, discharge %u mA, capacity %u mAh, cycles %u)", slot + 1,
-           mode.c_str(), mode_id == 0 || mode_id == 1 || mode_id == 4 ? chg : 0,
-           mode_id == 1 || mode_id == 3 || mode_id == 4 ? dis : 0, mode_id == 2 ? cap : 0, mode_id == 4 ? cyc : 0);
-  this->send_rfa_(std::vector<uint8_t>(p, p + sizeof(p)));
-  // Ask for the new state shortly afterwards instead of waiting for the next poll.
-  this->last_poll_ = millis() - this->poll_interval_ms_ + 2000;
+           mode.c_str(), uses_charge ? chg : 0, uses_discharge ? dis : 0, uses_capacity ? cap : 0,
+           uses_cycles ? cyc : 0);
+  this->send_set_slot_(p);
   return true;
 }
 
 bool SkyrcNC2500::stop_slot(uint8_t slot) {
-  if (slot >= NUM_SLOTS)
+  if (!this->check_slot_command_(slot, "stopped"))
     return false;
-  if (this->state_ != State::READY) {
-    ESP_LOGW(TAG, "Slot %u: not stopped - the charger is not connected", slot + 1);
-    return false;
-  }
-  if (!this->slot_present_[slot]) {
-    ESP_LOGW(TAG, "Slot %u: not stopped - there is no battery in it", slot + 1);
-    return false;
-  }
-
-  // A set-slot with mode 5 (Done) and no values ends the slot's program:
-  // 0F 0D 05 <slot> 05 00 00 00 00 00 00 00 00 00 <chk> FF FF
+  // Mode 5 (Done) with no values ends the slot's program.
   uint8_t p[17] = {0x0F, 0x0D, 0x05, slot, 0x05};
-  uint8_t sum = 0;
-  for (int i = 2; i < 14; i++)
-    sum += p[i];
-  p[14] = sum;
-  p[15] = 0xFF;
-  p[16] = 0xFF;
-
   ESP_LOGI(TAG, "Slot %u: stopping", slot + 1);
-  this->send_rfa_(std::vector<uint8_t>(p, p + sizeof(p)));
-  // Ask for the new state shortly afterwards instead of waiting for the next poll.
-  this->last_poll_ = millis() - this->poll_interval_ms_ + 2000;
+  this->send_set_slot_(p);
   return true;
 }
 
