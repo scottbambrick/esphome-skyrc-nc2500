@@ -13,7 +13,7 @@ and the current "SkyRC" phone app doesn't support it (the old *SkyRC Smart Charg
 - An **original ESP32** (classic Bluetooth). S2/S3/C3/C6 cannot do this.
 - ESPHome 2026.9 or newer with the ESP-IDF framework. Don't enable `esp32_ble` / `bluetooth_proxy` on the node.
   (Choosing an S2/S3/C3/C6 board is rejected when the config is validated.)
-- The charger switched on for Bluetooth (hold ENTER until the blue LED lights). It only answers while on.
+- The charger paired with the ESP32 once (below). After that it connects by itself whenever it is switched on.
 
 ## Use
 See [`example.yaml`](example.yaml). Minimum:
@@ -30,15 +30,29 @@ skyrc_nc2500:
     - voltage: { name: "Slot 1 Voltage" }
 ```
 
-On the first run leave `mac_address` unset: the ESP32 searches for a device whose name contains `skyrc`
-and logs what it finds. Copy the address into `mac_address` (and `channel: 2`) so later connections go
-straight to the charger.
+### Pairing (once)
+1. Leave `mac_address` unset and flash the ESP32.
+2. Put the charger in pairing mode: hold ENTER for 5 s, until the blue LED flashes.
+3. The ESP32 searches for a device whose name contains `skyrc`, pairs with PIN 1234 and connects. It logs what
+   it finds; copy the charger's address into `mac_address`, add `channel: 2`, and flash again.
 
-The charger accepts one Bluetooth connection at a time. The example has a "Bluetooth Link" switch to let go of
-it for the phone app.
+### Day to day
+Nothing to do: the charger doesn't need to be in pairing mode. When it is switched on it calls the devices it is
+paired with, and the ESP32 answers. It is connected about 20 s after switch-on, including after a quick off/on. The charger
+remembers up to eight paired devices; if pairing a new one fails, clear the list by holding UP and DOWN.
+
+The charger accepts one Bluetooth connection at a time. The example has a "Bluetooth Link" switch that lets go
+of it (and stops answering its calls) so the phone app can have it. When the switch is turned back on, the ESP32
+picks the charger up again (at the latest when it is next switched on).
+
+How the connection works in detail, and why: [`docs/protocol.md`](docs/protocol.md), section 1.
 
 ## Changes
 
+- **v0.3.0**: the ESP32 now connects automatically whenever the charger is switched on, without having to put
+  the charger in pairing mode, and reconnects within about 20 s if the charger is switched off and on again.
+  Break-In and Cycle are documented as tested (thanks [@rpcyan586](https://github.com/rpcyan586), #3). The code
+  follows ESPHome's style, checked in CI.
 - **v0.2.0**: `stop_slot()` and a "Slot N Stop" button per slot in the example (a set-slot with mode 5 ends
   the slot's program); Discharge is now tested on hardware; protocol notes corrected (present byte, state
   codes). Thanks to [@rpcyan586](https://github.com/rpcyan586) for both.
@@ -48,10 +62,12 @@ it for the phone app.
 
 To avoid `main` changing underneath you, pin the component to a
 [release](https://github.com/scottbambrick/esphome-skyrc-nc2500/releases):
-`source: github://scottbambrick/esphome-skyrc-nc2500@v0.2.0`.
+`source: github://scottbambrick/esphome-skyrc-nc2500@v0.3.0`.
 
 ## Status
 Working on real hardware (NC2500, firmware as of Oct 2026):
+- Connecting by itself when the charger is switched on (no pairing mode needed), including after quick off/on
+  cycles.
 - Reading all four slots.
 - **Charge**, **Refresh** and **Discharge** have been set and run on real cells (a complete Refresh and a complete
   Discharge).
@@ -83,7 +99,19 @@ from a node called `office-battery-charger` - adjust to yours.
   full cell the first charge stops within 20 s.
 
 ## Protocol
-[`docs/protocol.md`](docs/protocol.md) describes the full stack (link, module, adapter, session, charger layers).
+[`docs/protocol.md`](docs/protocol.md) describes how the connection is made and the full stack (link, module,
+adapter, session, charger layers).
+
+## Development
+The code follows ESPHome's style, so it reads like any other component: C++ formatted with ESPHome's
+`.clang-format` (Google-based: 2-space indent, 120 columns, `this->` for members, trailing `_` on protected ones),
+Python linted and formatted with ruff using ESPHome's rules (`pyproject.toml`). GitHub Actions checks both and
+compiles `example.yaml` on every push and pull request. To run the same checks locally before committing:
+`pip install pre-commit && pre-commit install`.
+
+Logs worth knowing when debugging a connection: `Radio link to ...: status 0x..` (0x04 = nobody answered),
+`Charger ... called in`, and `Bluetooth link open (charger opened it / we opened it)`. Set `log_frames: true` to
+see every message.
 
 ## Disclaimer
 Unofficial, not affiliated with SkyRC. You are charging batteries: use at your own risk.

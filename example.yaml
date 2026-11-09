@@ -34,10 +34,10 @@ external_components:
 
 skyrc_nc2500:
   id: charger
-  # The charger (it advertises as skyrcNNNN) is paired to this ESP32. With its address and serial channel known the
-  # ESP32 connects straight to it, like a phone reconnecting - no search, so no pairing mode needed.
-  # If you ever swap the charger, remove these two lines: the ESP32 then searches by name instead
-  # (hold ENTER on the charger until the blue LED lights so it can be found).
+  # The charger (it advertises as skyrcNNNN) is paired to this ESP32. When it is switched on it calls the ESP32 by
+  # itself; the address and serial channel also let the ESP32 call it directly when it is listening.
+  # To pair a new charger, remove these two lines and put the charger in pairing mode (hold ENTER until the
+  # blue LED flashes): the ESP32 then searches by name, pairs and logs the address to put back here.
   mac_address: "AA:BB:CC:DD:EE:FF"
   channel: 2
   name_match: skyrc        # used only when no mac_address is set
@@ -137,7 +137,8 @@ skyrc_nc2500:
       present:
         name: "Slot 4 Battery"
 
-# The charger accepts one Bluetooth connection at a time, so this lets go of it for the phone app.
+# The charger accepts one Bluetooth connection at a time. Off lets go of it (and stops answering its calls) so the
+# phone app can have it; on takes it back.
 switch:
   - platform: template
     name: "Bluetooth Link"

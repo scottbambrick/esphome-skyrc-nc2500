@@ -8,8 +8,40 @@ verified on a real charger.
 ## 1. Transport
 - Classic Bluetooth, RFCOMM serial port (SPP, UUID `00001101-0000-1000-8000-00805F9B34FB`), **not BLE**.
 - The charger advertises as `skyrcNNNN` and uses RFCOMM **channel 2**. Pairing PIN `1234`, with no prompt.
-- It only answers while its Bluetooth is on (hold ENTER until the blue LED lights) and accepts **one connection at a time**.
+- It accepts **one connection at a time** and remembers up to **eight paired devices** (when the list is full, new
+  pairings fail until it is cleared by holding UP and DOWN).
 - Inside the charger is an "iBT-02" serial bridge module, so the stack has several layers.
+
+### Who calls whom
+The charger mostly makes the connection itself:
+
+- **Pairing mode** (hold ENTER for 5 s; the blue LED flashes): the charger is discoverable and accepts
+  connections. It is only needed to pair a new device.
+- **Normal use** (not in pairing mode): the charger does **not** listen. When it is switched on, it calls the devices it
+  is paired with, opens the serial channel to the one that answers, and waits for the session start-up below. A
+  phone that has the charger paired therefore connects (or shows a pairing prompt) the moment the charger is
+  switched on.
+- Right after a connection (and for a while after one ends) it does listen, so calling it directly then works.
+
+So the ESP32 has to be **connectable** and run an **SPP server** for the charger to open; calling out alone only
+works in pairing mode or by luck. From switch-on, the charger takes about 20 s to call (most of it its own
+start-up).
+
+### Lost links
+When the charger is switched off mid-connection, the radio link only ends once its **link supervision timeout**
+runs out, and until then the ESP32 can neither call the charger nor accept its next call (the stack still thinks
+the old link is up). Only the link's master can set that timeout:
+
+- If the ESP32 called the charger it is master, and Bluedroid applies its default of 5 s.
+- If the charger called, the charger is master, and its own timeout leaves a dead link for well over a minute,
+  long enough for a quick off/on to be missed completely.
+
+The component therefore accepts incoming links as master (Bluedroid's internal `L2CA_SetDesireRole`, which has no
+public ESP-IDF equivalent and is reset on every link change, so it is re-asserted every second). It also sends a
+cheap query every 5 s between status polls and drops the link after 10 s without an acknowledgement, and after a
+lost link it leaves the radio free for the charger's call for 30 s before calling out itself (while calling, it
+can't hear the charger). Restarting Bluedroid to clear a dead link does not work: `esp_bluedroid_disable()`
+waits for the dead link and trips the task watchdog.
 
 ## 2. Layers, bottom to top
 
@@ -100,7 +132,9 @@ Progress estimates therefore have to track the phase themselves (see `home-assis
 
 ## 5. Details worth knowing
 - The adapter checksum differs for long messages (section 2, layer 3); the status reply is long.
-- After an unclean disconnect the charger can take about two minutes to accept a new connection.
+- After a lost link the charger can take a minute or two to settle; see "Lost links" in section 1.
+- When the ESP32 calls and nobody answers, the radio reports HCI status `0x04` (page timeout); `0x0D` (limited
+  resources) means the charger is busy with another link. The component logs these as "Radio link to ...".
 - Capacity units were confirmed by arithmetic: 56 mAh after 1019 s at 0.200 A = 0.2 x 1019 / 3600 x 1000.
 
 ## 6. Verification status
@@ -117,5 +151,8 @@ Checked on a real NC2500:
   currents in section 4.
 - **Cycle**: 2 cycles at 0.5 A and again at 1 A charge (0.4 A discharge) on two healthy NiMH AA cells, and 0.5 A
   runs on two weak cells, as in section 4.
+
+- **Connections** (Nov 2026): the charger calling the ESP32 at switch-on, not in pairing mode, after both
+  long and quick (under 10 s) off/on cycles; reconnected each time about 20-25 s after switch-off.
 
 Decoded from the vendor app but **never tried**: the system-settings commands.

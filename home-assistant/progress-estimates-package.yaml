@@ -7,9 +7,10 @@
 #              charger stops at 300 min (the 10 Oct test: three cells ended there at 0.2 A = 1000 mAh).
 #              Left = (target - charged mAh) / current.
 #   Discharge  capacity / discharge current; left = (capacity - mAh counted) / current.
-#   Refresh    charge + discharge + charge, with 1 h rests (rest length assumed).
-#   Break-In   0.1C for 16 h, rest 1 h, 0.2C discharge (5 h), rest 1 h, 0.1C for 16 h = 39 h (from a review).
-#   Cycle      charge, then N x (discharge, charge), 1 h rest between every step (rests from a review).
+#   Refresh    charge + discharge + charge, with 1 h rests (observed).
+#   Break-In   0.1C for 16 h, rest 1 h, 0.2C discharge (up to 5 h), rest 1 h, 0.1C for 16 h = 34-39 h (observed).
+#   Cycle      charge, then N x (discharge, charge), 1 h rest between every step (observed). Charges can end
+#              early (delta-V), so the estimate errs long.
 #   Refresh / Break-In / Cycle are multi-phase programs. VERIFIED on a live Refresh (11 Oct): the charger's run time
 #   RESTARTS AT 0 IN EVERY PHASE (charge 5 h, rest 1 h, discharge, rest 1 h, charge 5 h), and mode/capacity don't say
 #   which phase it is in. So sensor.*_program_phase (below) counts phase changes since the program started, and
